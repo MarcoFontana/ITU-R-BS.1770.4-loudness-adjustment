@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.1.32228.430
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Replay gain  ITU-R BS.1770.4", "Replay gain  ITU-R BS.1770.4\Replay gain  ITU-R BS.1770.4.csproj", "{5F8C9A4A-F5A6-4946-B288-AE67B7CCA7D1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5F8C9A4A-F5A6-4946-B288-AE67B7CCA7D1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5F8C9A4A-F5A6-4946-B288-AE67B7CCA7D1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5F8C9A4A-F5A6-4946-B288-AE67B7CCA7D1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5F8C9A4A-F5A6-4946-B288-AE67B7CCA7D1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {A0DD97E5-9502-4B45-A7EE-C3E31FC14018}
+	EndGlobalSection
+EndGlobal
