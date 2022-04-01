@@ -6,14 +6,28 @@ using System.Runtime.InteropServices;
 
 Bass.Init();
 
+/*
+ * 
+ * references links:
+ * 
+ * ITU-R BS.1770-4, Algorithms to measure audio programme loudness and true-peak audio level (https://www.itu.int/rec/R-REC-BS.1770-4-201510-I)
+ * EBU R 128, Loudness normalisation and permitted maximum level of audio signals (https://tech.ebu.ch/publications/e128)
+ * EBU TECH 3341, Loudness Metering: ‘EBU Mode’ metering to supplement loudness normalisation in accordance with EBU R 128 (https://tech.ebu.ch/publications/tech3341)
+ * 
+ * 
+ */
+
 //needed to apply effects
 var version = BassFx.Version;
 
-//absolute silence in ITU_R_BS._1770._4 guidelines (LUFS)
+//absolute silence in ITU_R_BS._1770._4 recommendation (LUFS)
 const double ABSOLUTE_SILENCE = -70;
 
 //same reference level as apple music (LUFS)
 const double REFERENCE_LEVEL = -16;
+
+//sampling frequency at which the filter coeffs are provided from the ITU_R_BS._1770._4 recommendation
+const double REFERENCE_SAMPLING_FREQUENCY = 48000.0;
 
 Console.Write("Write the path to the audio: ");
 string path = Console.ReadLine();
@@ -33,7 +47,11 @@ else
 
 Stopwatch stopWatch = new();
 stopWatch.Start();
-
+/*
+ * 
+ * Load track into Bass and initialize majority of variables needed
+ * 
+ */
 //load the track and read it's info
 var decodeStream = Bass.CreateStream(path, 0, 0, BassFlags.Decode | BassFlags.Float);
 
@@ -67,21 +85,62 @@ double peakAmp = 0;
 //for thread safety when writing peakAmp
 object maxLock = new object();
 
+/*
+ * 
+ *  this section allocates the coefficients fot the “K” frequency weighting
+ *  requested from the from ITU_R_BS._1770._4 recommendation.
+ * 
+ */
 
 //pre-filter coeffs to model a spherical head
 double[] headA;
 double[] headB;
 
-
 //high-pass coeffs
 double[] highPassA;
 double[] highPassB;
 
-headA = new double[] { -1.69065929318241, 0.73248077421585 };
-headB = new double[]{ 1.53512485958697, -2.69169618940638, 1.19839281085285 };
+if (info.Frequency == 48000)
+{
+    //filter coeffs for 48000hz sampling rate (from ITU_R_BS._1770._4 guidelines)
+    headA = new double[] { -1.69065929318241, 0.73248077421585 };
+    headB = new double[] { 1.53512485958697, -2.69169618940638, 1.19839281085285 };
 
-highPassA = new double[] { -1.99004745483398, 0.99007225036621 };
-highPassB = new double[] { 1.0, -2.0, 1.0 };
+    highPassA = new double[] { -1.99004745483398, 0.99007225036621 };
+    highPassB = new double[] { 1.0, -2.0, 1.0 };
+}
+else if (info.Frequency == 44100)
+{
+    //filter coeffs for 44100hz sampling rate precalculated for speed
+    headA = new double[] { -1.6636551132560202, 0.7125954280732254};
+    headB = new double[] { 1.5308412300503478, -2.650979995154729, 1.1690790799215869 };
+
+    highPassA = new double[] { -1.9891696736297957, 0.9891990357870394 };
+    highPassB = new double[] { 0.9995600645425144, -1.999120129085029, 0.9995600645425144 };
+}
+else
+{
+
+    //for the rest of the sampling rates coeffs are recalculated at runtime
+    headA = new double[] { -1.69065929318241, 0.73248077421585 };
+    headB = new double[] { 1.53512485958697, -2.69169618940638, 1.19839281085285 };
+
+    highPassA = new double[] { -1.99004745483398, 0.99007225036621 };
+    highPassB = new double[] { 1.0, -2.0, 1.0 };
+
+    filterCoeffsRecalc(info.Frequency, headA, headB);
+    filterCoeffsRecalc(info.Frequency, highPassA, highPassB);
+}
+
+
+/*
+ * 
+ * Multi-threaded calculus of the sum of squared samples for each channel after the
+ * “K” frequency weighting is applied.
+ * Peak amplitude is also found in a naive way by storing the max absolute value
+ * of the samples.
+ * 
+ */
 
 //list of started tasks
 List<Task> squareSegmentTasks = new List<Task>();
@@ -93,11 +152,13 @@ while (length == bytesPerWindow)
     //start a task for every 100ms window
     for (int i = 0; i < info.Channels; i++)
     {
-
+        //task parameters
         int currChannel = i;
         int currSegment = segNumber;
         float[] currentBuffer = new float[sampleBuffer.Length];
         Array.Copy(sampleBuffer, currentBuffer, sampleBuffer.Length);
+
+        //pre allocation of the memory that the task will write into
         squaredSegments[i].Add(0);
         squareSegmentTasks.Add( Task.Run(() => segmentSquaredByChannel(currChannel, currentBuffer, currSegment)));
 
@@ -110,10 +171,27 @@ while (length == bytesPerWindow)
 }
 Bass.StreamFree(decodeStream);
 
+
+/*
+ * 
+ * calculation of the mean square for each channel over 400ms windows overlapping by 75%
+ * as per ITU_R_BS._1770._4 recommendation.
+ * 
+ */
+
 //list of the squared mean for the overlapping 400ms windows
 List<double>[] squaredMeanByChannel = new List<double>[info.Channels].Select(item => new List<double> { }).ToArray();
 
-Task.WaitAll(squareSegmentTasks.ToArray());
+try
+{
+    Task.WaitAll(squareSegmentTasks.ToArray());
+}
+catch (AggregateException ae)
+{
+    Console.WriteLine("One or more exceptions occurred: ");
+    foreach (var ex in ae.Flatten().InnerExceptions)
+        Console.WriteLine("   {0}", ex.Message);
+}
 
 if (squaredSegments[0].Count == 0)
 {
@@ -123,21 +201,42 @@ if (squaredSegments[0].Count == 0)
 
 List<Task> squaremeanTasks = new List<Task>();
 
+//start from 400ms in since windowedSquaredMean reads previous segments
 for (int i = 3; i < squaredSegments[0].Count; i++)
 {
     for(int j = 0; j < info.Channels; j++)
     {
+        //task paramenters
         int currChannel = j;
         int currSegment = i;
+
+        //pre allocation of the memory that the task will write into
         squaredMeanByChannel[currChannel].Add(0);
         squaremeanTasks.Add(Task.Run(() => windowedSquaredMean(currChannel, currSegment)));
     }
 }
 
+
+/*
+ * 
+ * Pre gating loudness of each 400ms window in LUFS as per ITU_R_BS._1770._4 recommendation.
+ * this specific implementation will not work well for channel counts above 5.
+ * 
+ */
+
 //loudness of each 400ms window when all channels are summed
 List<double> blockLoudness = new List<double> { };
 
-Task.WaitAll(squaremeanTasks.ToArray());
+try
+{
+    Task.WaitAll(squaremeanTasks.ToArray());
+}
+catch (AggregateException ae)
+{
+    Console.WriteLine("One or more exceptions occurred: ");
+    foreach (var ex in ae.Flatten().InnerExceptions)
+        Console.WriteLine("   {0}", ex.Message);
+}
 
 if (info.Channels > 3 && info.Channels < 6)
 {
@@ -183,6 +282,12 @@ else
     }
 }
 
+/*
+ * 
+ * gated loudness calc as per ITU_R_BS._1770._4 recommendation.
+ * 
+ */
+
 double relativeGate = relativeGateCalc();
 
 if (squaredMeanByChannel[0].Count == 0)
@@ -205,7 +310,9 @@ Console.WriteLine("RunTime(H:M:S:Ms) " + elapsedTime + "\n");
 
 Console.WriteLine("Original loundess(LUFS): " + currLoudness);
 
+//Gain in LUFS that needs to be applied to the track
 double gain = REFERENCE_LEVEL - currLoudness;
+
 Console.WriteLine("Gain needed: " + gain);
 Console.WriteLine("Peak amplitude: "+ peakAmp);
 
@@ -245,9 +352,9 @@ if (Math.Pow(10, gain  / 20) * peakAmp >= 1)
     Bass.FXGetParameters(compressor, compParams);
     compParams.fAttack = 0.01f;
     compParams.fGain = 0;
-    compParams.fRatio = 1.5f;
+    compParams.fRatio = 30f;
     compParams.fRelease = 200;
-    compParams.fThreshold = -50;
+    compParams.fThreshold = -18;
     Bass.FXSetParameters(compressor, compParams);
 
 }
@@ -285,6 +392,11 @@ void segmentSquaredByChannel(int channel, float[] data, int segmentIndex)
 
     for (int s = channel; s < data.Length; s+= info.Channels)
     {
+        /*
+         * 
+         * “K” frequency weighting for each sample
+         * 
+         */
 
         //apply the 1st pre-filter to the sample
         double yuleSample = headB[0] * data[s] + headB[1] * pastX0 + headB[2] * pastX1
@@ -304,7 +416,9 @@ void segmentSquaredByChannel(int channel, float[] data, int segmentIndex)
         pastZlow0 = yuleSample;
         pastY0 = tempsample;
 
-
+        /*
+         * sum of squared samples and localMax update
+         */
         partialSample += tempsample * tempsample;
 
         if (Math.Abs(data[s]) > localMax)
@@ -314,8 +428,10 @@ void segmentSquaredByChannel(int channel, float[] data, int segmentIndex)
 
     }
 
+    //memorize the sum of squared samples for the given data
     squaredSegments[channel][segmentIndex] = partialSample;
 
+    //thread safe update of peak Amplitude
     if (localMax > peakAmp)
     {
         lock (maxLock)
@@ -340,13 +456,15 @@ void windowedSquaredMean(int channel, int segmentIndex)
         + squaredSegments[channel][segmentIndex]) / totalWindowLength;
 }
 
-//calc of the relative gate for the loudness as per ITU_R_BS._1770._4 guidelines
+//calc of the relative gate for the loudness as per ITU_R_BS._1770._4 recommendation
 double relativeGateCalc()
 {
 
     double tempTotLoudness = 0;
     int nonSilenceSegments = 0;
-
+    /*
+     * removal of segments below the silence threshold
+     */
     for (int i = 0; i < blockLoudness.Count; i++)
     {
         if (blockLoudness[i] > ABSOLUTE_SILENCE)
@@ -367,16 +485,20 @@ double relativeGateCalc()
         }
     }
 
+    //relative gate as per ITU_R_BS._1770._4 recommendation
     return -0.691 + 10 * Math.Log10(tempTotLoudness / nonSilenceSegments) - 10;
 }
 
-//calc of the double gated loudness as per ITU_R_BS._1770._4 guidelines
+//calc of the double gated loudness as per ITU_R_BS._1770._4 recommendation
 double gatedLoudnessCalc(double relativeGate)
 {
 
     double tempTotLoudness = 0;
     int aboveGatesSegments = 0;
 
+    /*
+     * removal of segments below the relative gate threshold
+     */
     for (int i = 0; i < blockLoudness.Count; i++)
     {
         if (blockLoudness[i] > relativeGate)
@@ -390,6 +512,34 @@ double gatedLoudnessCalc(double relativeGate)
     }
 
     return -0.691 + 10 * Math.Log10(tempTotLoudness / aboveGatesSegments);
+}
+
+//calc of filter coeffs for sampling rates different from 48000
+void filterCoeffsRecalc(double samplingFreq, double[] a, double[] b)
+{
+
+    /*
+     * adapted from https://github.com/klangfreund/LUFSMeter/blob/master/filters/SecondOrderIIRFilter.cpp
+     * derivation of the equations can be found at https://github.com/klangfreund/LUFSMeter/blob/master/docs/developmentNotes/111222_filter_coefficients/111222_my_notes_to_the_calculation_of_the_filter_coefficients.tif
+     *
+     */
+    double KoverQ = (2.0 - 2.0 * a[1]) / (a[1] - a[0] + 1.0);
+    double K = Math.Sqrt((a[0] + a[1] + 1.0) / (a[1] - a[0] + 1.0));
+    double Q = K / KoverQ;
+    double ArctanK = Math.Atan(K);
+    double VB = (b[0] - b[2]) / (1.0 - a[1]);
+    double VH = (b[0] - b[1] + b[2]) / (a[1] - a[0] + 1.0);
+    double VL = (b[0] + b[1] + b[2]) / (a[0] + a[1] + 1.0);
+
+    double newK = Math.Tan(ArctanK * REFERENCE_SAMPLING_FREQUENCY / samplingFreq);
+    double commonFactor = 1.0 / (1.0 + newK / Q + newK * newK);
+    
+    b[0] = (VH + VB * newK / Q + VL * newK * newK) * commonFactor;
+    b[1] = 2.0 * (VL * newK * newK - VH) * commonFactor;
+    b[2] = (VH - VB * newK / Q + VL * newK * newK) * commonFactor;
+    a[0] = 2.0 * (newK * newK - 1.0) * commonFactor;
+    a[1] = (1.0 - newK / Q + newK * newK) * commonFactor;
+
 }
 
 
